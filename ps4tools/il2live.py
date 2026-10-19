@@ -593,8 +593,8 @@ async def amain(a):
         import ps4debug
         dbg = ps4debug.PS4Debug(a.host)
         pid = await game_pid(dbg)
-        maps = await dbg.get_process_maps(pid)
-        bases = [e.start for e in maps.entries if e.name == a.module]
+        maps = await dbg.get_process_maps(pid)            # a list of map entries (name, start, end, prot)
+        bases = [e.start for e in maps if e.name.rstrip("\0") == a.module]
         if not bases:
             sys.exit(f"{a.module} not mapped in pid {pid}; is the game running?")
         base = min(bases)
