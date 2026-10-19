@@ -37,7 +37,7 @@ python il2live.py castle "GameStateManager::_instance._mainCharacterEntity.compo
 python il2cheat.py castle "Castlevania_PPSA35399.TLH" --game "Castlevania: Belmont's Curse" --version 1.00 "Health 999=GameStateManager::_instance._mainCharacterEntity.componentCache{609408304}.CurrentStats{Type=HealthCurrent}.baseValue=999"
 ```
 
-Trainer notes: the hook entry uses `Section-Name` `Il2CppUserAssemblies.prx:5` (text segment, AOB unique inside it) and
+Trainer notes: the hook entry uses `Section-Name` `Il2CppUserAssemblies.prx` with `Section-Protection` 5 (text segment, AOB unique inside it; uTrainer/Phoenix tags, the cheat menu PRX reads them too) and
 `ModuleBase+offset` symbols for the TypeInfo table and the metadata pointer, loaded with `mov rax, Symbol` because the
 module sits above 4 GB. Dictionary hops with int keys and `{Type=X}` keys are matched at runtime, `{_guid=...}` and
 string keys use the entry index seen in the dump (entry order only changes when something is removed from the

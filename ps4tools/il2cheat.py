@@ -287,7 +287,7 @@ async def amain(a):
            f'<Trainer xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
            f'Game="{game}" Creator="il2cheat" CUSA="{cusa}" Version="{a.version}" Process="eboot.bin" Legacy="1">',
            f'  <StartUP Name="IL2CPP hook ({xml_escape(hook)})" Description="static roots via the il2cpp TypeInfo table, resolved every frame">',
-           '    <Entry>', '      <Section>0</Section>', f'      <Section-Name>{a.module}:5</Section-Name>', f'      <AOB>{aob_s}</AOB>',
+           '    <Entry>', '      <Section>0</Section>', f'      <Section-Name>{a.module}</Section-Name>', '      <Section-Protection>5</Section-Protection>', f'      <AOB>{aob_s}</AOB>',
            '      <Type>Injection</Type>', f'      <Assembly>{xml_escape(asm)}</Assembly>', '    </Entry>', '  </StartUP>']
     for name, entries in cheats:
         xml.append(f'  <Cheat Name="{xml_escape(name)}" Description="">')
