@@ -2,6 +2,8 @@
 
     python il2diff.py <dumpdir> dump_mana_50.json dump_mana_77.json --eq 50 77
     python il2diff.py <dumpdir> a.json b.json --eq 50 77 --depth 10 --paths 3
+    python il2diff.py <dumpdir> before.json after.json --changed [--same before2.json] [--class Marker]
+        # no value needed: every int/float/bool/enum field of a game object that differs, then paths for the first hits
 
 Both dumps come from ps4dump.py in ONE game session (object addresses must match), <dumpdir>/sdk/dump.cs from
 Il2CppDumper. --eq A B keeps the 32-bit ints and floats that are A in the first dump and B in the second.
@@ -105,11 +107,9 @@ class Diff:
         return f"{t.full}::{name}" if name else None
 
     def field_name(self, t, off):
-        c = t
-        while c:
+        for c in self.res.chain(t):
             if off in c.fields:
                 return c.fields[off][1], c.fields[off][0]
-            c = self.res.find_type(c.bases[0], c.ns) if c.bases and c.bases[0] else None
         return None, None
 
     async def step_up(self, va):
@@ -207,6 +207,63 @@ class Diff:
                 break
         return out
 
+    # ---- --changed: every scalar field of game objects that differs between the dumps ------------------------------------
+    def changed(self, images, cls_filter, same=None):
+        """[(address, 'Class.field', type, value a, value b)] for scalar fields of objects whose class lives in one of
+        `images` (dump.cs image names, substring match). `same` = third dump in which the value must equal dump a
+        (a second dump of the unchanged state filters timers, positions and other constantly moving values).
+        Per region: changed 32-bit words via numpy, then only fields that lie on a changed word are decoded."""
+        game = {}
+        for k, name in self.rt.klasses.items():
+            if name.endswith("[]"):
+                continue
+            t = self.rt.type_of_klass(k)
+            if t and t.kind == "class" and any(i.lower() in t.image.lower() for i in images) and (not cls_filter or cls_filter.lower() in t.full.lower()):
+                game[k] = t
+        karr = np.array(sorted(game), dtype=np.uint64)
+        layouts = {}
+        for t in game.values():
+            if t.full in layouts:
+                continue
+            fields = []
+            for c in self.res.chain(t):
+                for off, (ft, fn) in c.fields.items():
+                    fmt = il2live.value_format(self.res, ft)
+                    if fmt != "Q":
+                        fields.append((off, fn, ft, fmt))
+            layouts[t.full] = fields
+        out, objects = [], 0
+        for r, a in self.a.arrays():
+            rb = [x for x in self.b.regs if x["start"] <= r["start"] < x["end"]]
+            if not rb:
+                continue
+            rb = rb[0]
+            hi = min(r["end"], rb["end"])
+            n = (hi - r["start"]) // 4
+            x = np.frombuffer(self.a.m, dtype=np.uint32, count=n, offset=r["offset"])
+            y = np.frombuffer(self.b.m, dtype=np.uint32, count=n, offset=rb["offset"] + r["start"] - rb["start"])
+            changed = np.flatnonzero(x != y)
+            if len(changed) == 0:
+                continue
+            changed_words = set(changed.tolist()) if len(changed) < 1 << 20 else None
+            for idx in np.nonzero(np.isin(a, karr))[0]:
+                obj = r["start"] + int(idx) * 8
+                t = game[int(a[idx])]
+                objects += 1
+                for off, fn, ft, fmt in layouts[t.full]:
+                    w = (obj + off - r["start"]) // 4
+                    if w >= n or (changed_words is not None and w not in changed_words) or (changed_words is None and x[w] == y[w]):
+                        continue
+                    size = struct.calcsize(fmt)
+                    ba, bb = self.a.read(obj + off, size), self.b.read(obj + off, size)
+                    if ba is None or bb is None or ba == bb:
+                        continue
+                    if same is not None and same.read(obj + off, size) != ba:
+                        continue
+                    out.append((obj + off, f"{t.full}.{fn}", ft, struct.unpack("<" + fmt, ba)[0], struct.unpack("<" + fmt, bb)[0]))
+        print(f"{objects} objects of {len(game)} game classes compared, {len(out)} scalar fields differ", file=sys.stderr)
+        return out
+
     async def verify(self, path):
         vals = []
         for d in (self.a, self.b):
@@ -224,6 +281,17 @@ class Diff:
 
 async def amain(a):
     diff = Diff(a.dumpdir, a.a, a.b, a.depth, a.parents)
+    if a.changed:
+        same = il2live.Dump(a.dumpdir, a.same) if a.same else None
+        rows = diff.changed(a.images.split(","), a.cls, same)
+        for addr, name, ft, va, vb in rows:
+            print(f"{name}	{ft}	{va}	{vb}	@ {addr:#x}")
+        for addr, name, ft, va, vb in rows[:a.hits]:
+            for p in await diff.paths_to(addr, a.paths):
+                v = await diff.verify(p)
+                if v:
+                    print(f"{p}	{v[0][1]}	{v[0][0]}	{v[1][0]}")
+        return
     hits = diff.scan(a.eq[0], a.eq[1])
     shared = sum(min(r["end"], rb["end"]) - max(r["start"], rb["start"]) for r in diff.a.regs for rb in diff.b.regs if min(r["end"], rb["end"]) > max(r["start"], rb["start"]))
     print(f"{len(hits)} locations are {a.eq[0]} in {a.a} and {a.eq[1]} in {a.b} ({shared >> 20} MB compared)", file=sys.stderr)
@@ -245,10 +313,16 @@ if __name__ == "__main__":
     ap.add_argument("dumpdir")
     ap.add_argument("a", help="first dump json (e.g. dump_mana_50.json)")
     ap.add_argument("b", help="second dump json")
-    ap.add_argument("--eq", nargs=2, required=True, metavar=("A", "B"), help="value in the first and in the second dump")
+    ap.add_argument("--eq", nargs=2, metavar=("A", "B"), help="value in the first and in the second dump")
+    ap.add_argument("--changed", action="store_true", help="list every scalar field of game objects that differs between the dumps")
+    ap.add_argument("--same", help="third dump json in which the value must still equal the first dump (filters moving values)")
+    ap.add_argument("--images", default="Assembly-CSharp", help="comma separated image name substrings for --changed (default Assembly-CSharp)")
+    ap.add_argument("--class", dest="cls", help="only classes whose name contains this (for --changed)")
     ap.add_argument("--depth", type=int, default=10, help="reference hops from the value to a static field (default 10)")
     ap.add_argument("--paths", type=int, default=3, help="paths to report per hit (default 3)")
     ap.add_argument("--parents", type=int, default=6, help="references followed per object (default 6)")
     ap.add_argument("--hits", type=int, default=20, help="hits to trace (default 20)")
     args = ap.parse_args()
+    if not args.eq and not args.changed:
+        ap.error("--eq A B or --changed required")
     asyncio.run(amain(args))

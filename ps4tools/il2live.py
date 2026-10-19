@@ -1,8 +1,8 @@
 """Read / write a value in a running Unity IL2CPP game (PS4/PS5) by a path that starts at a static field.
 
     python il2live.py <dumpdir> "GameStateManager::_instance._mainCharacterEntity.componentCache{611004928}.manas[0]._currentManaStatObject.baseValue"
-    python il2live.py <dumpdir> "<path>" --host 192.168.1.49            # live read (ps4debug)
-    python il2live.py <dumpdir> "<path>" --host 192.168.1.49 --set 999  # live write
+    python il2live.py <dumpdir> "<path>" --host 192.168.0.10            # live read (ps4debug)
+    python il2live.py <dumpdir> "<path>" --host 192.168.0.10 --set 999  # live write
     python il2live.py <dumpdir> --find mana                              # paths from all static fields whose field name contains "mana"
     python il2live.py <dumpdir> --find 50.0 --depth 4                    # ... whose value is 50.0
 
@@ -35,6 +35,7 @@ PRIM = dict(bool=("?", 1), sbyte=("b", 1), byte=("B", 1), short=("h", 2), ushort
             long=("q", 8), ulong=("Q", 8), float=("f", 4), double=("d", 8), char=("H", 2), IntPtr=("Q", 8), UIntPtr=("Q", 8))
 MODS = {"public", "private", "internal", "protected", "static", "readonly", "const", "volatile", "abstract", "sealed", "new", "unsafe"}
 TYPE_RE = re.compile(r"^(?P<mods>(?:\w+\s+)*?)(?P<kind>class|struct|enum|interface)\s+(?P<name>[^\s<]+(?:<[^>]*>)?)(?:\s*:\s*(?P<bases>.*?))?\s*// TypeDefIndex: (?P<idx>\d+)")
+IMAGE_RE = re.compile(r"^// Image \d+: (?P<name>\S+) - (?P<start>\d+)")
 FIELD_RE = re.compile(r"^\t(?P<decl>.+?)(?: = (?P<val>.*?))?; // 0x(?P<off>[0-9A-Fa-f]+)$")
 
 
@@ -43,6 +44,7 @@ class Type:
     def __init__(self, kind, name, ns, bases, idx):
         self.kind, self.name, self.ns, self.bases, self.idx = kind, name, ns, bases, idx
         self.fields, self.statics, self.enum_base = {}, {}, "int"      # offset -> (type, name)
+        self.image = ""
 
     @property
     def full(self):
@@ -51,9 +53,12 @@ class Type:
 
 def parse_dump_cs(path):
     """-> {full name: Type}; full name = Namespace.Outer.Inner"""
-    types, ns, cur = {}, "", None
+    types, ns, cur, images = {}, "", None, []
     for line in open(path, encoding="utf-8", errors="replace"):
         line = line.rstrip("\r\n")
+        m = IMAGE_RE.match(line)
+        if m:
+            images.append((int(m["start"]), m["name"])); continue
         if line.startswith("// Namespace: "):
             ns = line[14:].strip(); continue
         m = TYPE_RE.match(line)
@@ -80,6 +85,11 @@ def parse_dump_cs(path):
                 cur.statics[off] = (typ, name)
             else:
                 cur.fields[off] = (typ, name)
+    images.sort()
+    for t in types.values():
+        for start, name in images:
+            if t.idx >= start:
+                t.image = name
     for t in types.values():                        # open generics have no offsets in dump.cs: measured layouts
         base = t.name.split("<")[0]
         if base in GENERIC_LAYOUT and t.fields and all(o == 0 for o in t.fields):
@@ -171,6 +181,7 @@ class Runtime:
         self.typedef_names = {t.idx: t.full for t in types.values()}
         self.module = module
         self.base = dump.module_base(module)
+        self._type_cache = {}
         cache = dump.path + ".klasses.json"            # the two numpy passes take ~50 s on a 3 GB dump
         try:
             c = json.load(open(cache))
@@ -271,14 +282,22 @@ class Runtime:
         return ks[0]
 
     def type_of_klass(self, k):
-        """dump.cs Type for a runtime class (generic instances map to their open definition)."""
+        """dump.cs Type for a runtime class (generic instances map to their open definition). Cached: called per object."""
+        if k in self._type_cache:
+            return self._type_cache[k]
         full = self.full_name(k)
-        if full in self.types:
-            return self.types[full]
-        short = full.split(".")[-1]
-        base = split_generic(short)[0].split("`")[0]          # runtime names generic instances Dictionary`2, dump.cs Dictionary<TKey, TValue>
-        cands = [t for t in self.types.values() if t.name.split("<")[0] == base or t.name == short]
-        return cands[0] if cands else None
+        t = self.types.get(full)
+        if t is None:
+            short = full.split(".")[-1]
+            base = split_generic(short)[0].split("`")[0]      # runtime names generic instances Dictionary`2, dump.cs Dictionary<TKey, TValue>
+            if not hasattr(self, "_by_base"):
+                self._by_base = {}
+                for x in self.types.values():
+                    self._by_base.setdefault(x.name.split("<")[0], []).append(x)
+            cands = self._by_base.get(base) or [x for x in self.types.values() if x.name == short]
+            t = cands[0] if cands else None
+        self._type_cache[k] = t
+        return t
 
     def object_type(self, obj):
         k = self.d.u64(obj)
@@ -323,29 +342,48 @@ class Runtime:
 class Resolver:
     def __init__(self, rt):
         self.rt, self.types = rt, rt.types
+        self.by_base = {}                 # 'Dictionary' -> types named Dictionary<...>, 'Inner' -> Outer.Inner types, ...
+        for f, t in self.types.items():
+            self.by_base.setdefault(t.name.split("<")[0], []).append(t)
+            if "." in f:
+                for i in range(f.count(".")):            # Ns.Outer.Inner is also reachable as Outer.Inner and Inner
+                    self.by_base.setdefault(f.split(".", i + 1)[-1].split("<")[0], []).append(t)
+        self.cache = {}
 
     def find_types(self, name):
         base = split_generic(name)[0]
-        return [t for f, t in self.types.items() if f == name or f == base or f.endswith("." + base) or t.name.split("<")[0] == base]
+        seen, out = set(), []
+        for t in (self.types.get(name), self.types.get(base), *self.by_base.get(base, [])):
+            if t is not None and id(t) not in seen:
+                seen.add(id(t)); out.append(t)
+        return out
 
     def find_type(self, name, hint_ns=""):
-        if name in self.types:
-            return self.types[name]
-        if hint_ns and f"{hint_ns}.{name}" in self.types:
-            return self.types[f"{hint_ns}.{name}"]
-        base, _ = split_generic(name)
-        cands = [t for f, t in self.types.items() if f == base or f.endswith("." + base) or t.name.split("<")[0] == base]
-        same = [t for t in cands if t.ns == hint_ns]
-        return (same or cands)[0] if cands else None
+        key = (name, hint_ns)
+        if key in self.cache:
+            return self.cache[key]
+        t = self.types.get(name) or (self.types.get(f"{hint_ns}.{name}") if hint_ns else None)
+        if t is None:
+            cands = self.find_types(name)
+            same = [c for c in cands if c.ns == hint_ns]
+            t = (same or cands)[0] if cands else None
+        self.cache[key] = t
+        return t
+
+    def chain(self, t):
+        """t and its base classes, cycle safe (a base name can resolve back to the class itself)."""
+        seen = set()
+        while t is not None and id(t) not in seen and len(seen) < 64:
+            seen.add(id(t))
+            yield t
+            t = self.find_type(t.bases[0], t.ns) if t.bases and t.bases[0] else None
 
     def field(self, t, name):
         """(offset, type string, owner Type) walking base classes."""
-        c = t
-        while c:
+        for c in self.chain(t):
             for off, (ft, fn) in c.fields.items():
                 if fn == name:
                     return off, ft, c
-            c = self.find_type(c.bases[0], c.ns) if c.bases and c.bases[0] else None
         return None
 
     def tokens(self, path):
@@ -483,8 +521,7 @@ async def dict_key_names(res, rt, read, ktype, entry):
             name = None
         return [f"Type={name}", f"Type={name.split('.')[-1]}"] if name else []
     out = []
-    c = kt
-    while c:
+    for c in res.chain(kt):
         for off, (ft, fn) in c.fields.items():
             if fn in KEY_ID_FIELDS and ft in ("string", "int", "uint", "long"):
                 try:
@@ -495,7 +532,6 @@ async def dict_key_names(res, rt, read, ktype, entry):
                     out.append(f"{fn}={v}")
                 except LookupError:
                     pass
-        c = res.find_type(c.bases[0], c.ns) if c.bases and c.bases[0] else None
     return out
 
 
@@ -631,11 +667,9 @@ async def children(res, rt, read, path, addr, ftype):
     t = await rt.object_type_live(read, obj) or res.find_type(ftype)
     if not t or t.kind not in ("class", "struct") or t.ns.startswith(("System", "UnityEngine", "TMPro", "Unity.")):
         return []
-    c = t
-    while c:
+    for c in res.chain(t):
         for off, (ft, fn) in c.fields.items():
             out.append((f"{path}.{fn}", obj + off, ft, 0))
-        c = res.find_type(c.bases[0], c.ns) if c.bases and c.bases[0] else None
     return out
 
 
