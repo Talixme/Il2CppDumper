@@ -62,6 +62,9 @@
     <None Update="il2cpp_header_to_ghidra.py">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <None Include="../ps4tools/il2mem.py" Link="il2mem.py">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
 </Project>
