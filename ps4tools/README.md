@@ -11,6 +11,7 @@ ps4-unreal-dumper makes the memory dumps (`dump.bin` + `dump.json`).
 | `il2mem.py <dumpdir>` | pulls `global-metadata.dat` and a loadable image of `Il2CppUserAssemblies.prx` out of a memory dump, so Il2CppDumper runs without touching the PKG. Run the dumper on the two outputs with `"NoRedirectedPointer": true` in config.json and the printed base as dump address, put the result in `<dumpdir>/sdk`. |
 | `il2live.py <dumpdir> "<path>" [--host IP] [--set V]` | reads / writes a value by a path that starts at a static field. Without `--host` it resolves against the dump (offline check), with `--host` live. `--find word` or `--find 50` lists paths from every static field (`--depth`). |
 | `il2diff.py <dumpdir> a.json b.json --eq 50 77` | two dumps of one session, value before and after: every matching address, walked back to a static field and printed as an il2live path. |
+| `il2cheat.py <dumpdir> out.TLH "Name=path=value" ...` | TLH trainer from il2live paths: one StartUP injection on an `Update()` of a game class (auto-picked, `--hook Class` to choose), per cheat a flag and a value cell; every path is resolved from its static root on every frame through the il2cpp TypeInfo table, so the trainer survives restarts. `--check path` prints the hops and compares them with il2live against the dump. Needs capstone. |
 | `il2diff.py <dumpdir> a.json b.json --changed [--class Name] [--same c.json]` | no value needed: every int / float / bool / enum field of a game object that differs between the dumps, then paths for the first hits. `--same` is a third dump of the unchanged state that filters moving values. |
 
 Path syntax, passed through GUIs unchanged:
@@ -33,7 +34,14 @@ python il2mem.py castle                                   # castle/ holds dump.b
 Il2CppDumper castle/Il2CppUserAssemblies.prx.elf castle/global-metadata.dat castle/sdk
 python il2diff.py castle dump_mana_50.json dump_mana_77.json --eq 50 77
 python il2live.py castle "GameStateManager::_instance._mainCharacterEntity.componentCache{609408304}.CurrentStats{Type=HealthCurrent}.baseValue" --host 192.168.0.10 --set 999
+python il2cheat.py castle "Castlevania_PPSA35399.TLH" --game "Castlevania: Belmont's Curse" --version 1.00 "Health 999=GameStateManager::_instance._mainCharacterEntity.componentCache{609408304}.CurrentStats{Type=HealthCurrent}.baseValue=999"
 ```
+
+Trainer notes: the hook entry uses `Section-Name` `Il2CppUserAssemblies.prx:5` (text segment, AOB unique inside it) and
+`ModuleBase+offset` symbols for the TypeInfo table and the metadata pointer, loaded with `mov rax, Symbol` because the
+module sits above 4 GB. Dictionary hops with int keys and `{Type=X}` keys are matched at runtime, `{_guid=...}` and
+string keys use the entry index seen in the dump (entry order only changes when something is removed from the
+dictionary). Flag/Val cells are GetMem cells addressed as `[Flag1]`, like the Unreal trainers.
 
 Notes measured on real dumps (metadata v29 / v31, x64):
 
