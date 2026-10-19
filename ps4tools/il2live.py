@@ -80,7 +80,21 @@ def parse_dump_cs(path):
                 cur.statics[off] = (typ, name)
             else:
                 cur.fields[off] = (typ, name)
+    for t in types.values():                        # open generics have no offsets in dump.cs: measured layouts
+        base = t.name.split("<")[0]
+        if base in GENERIC_LAYOUT and t.fields and all(o == 0 for o in t.fields):
+            t.fields = dict(GENERIC_LAYOUT[base])
     return types
+
+
+GENERIC_LAYOUT = {
+    "List": {0x10: ("T[]", "_items"), 0x18: ("int", "_size"), 0x1C: ("int", "_version")},
+    "Dictionary": {0x10: ("int[]", "_buckets"), 0x18: ("Entry[]", "_entries"), 0x20: ("int", "_count"), 0x24: ("int", "_freeList"),
+                   0x28: ("int", "_freeCount"), 0x2C: ("int", "_version")},
+    "HashSet": {0x10: ("int[]", "_buckets"), 0x18: ("Slot[]", "_slots"), 0x20: ("int", "_count")},
+    "Stack": {0x10: ("T[]", "_array"), 0x18: ("int", "_size"), 0x1C: ("int", "_version")},
+    "Queue": {0x10: ("T[]", "_array"), 0x18: ("int", "_head"), 0x1C: ("int", "_tail"), 0x20: ("int", "_size")},
+}
 
 
 def split_generic(t):
@@ -407,22 +421,59 @@ async def follow(res, rt, read, base, path, auto_cast=True, trace=None):
                 found = None
                 for n in range(count):
                     e = entries + 0x20 + n * 0x18
-                    if ktype == "string":
-                        sp = await read_u64(read, e + 8)
-                        ln = struct.unpack("<i", await read_(read, sp + 0x10, 4))[0] if sp else -1
-                        key = (await read_(read, sp + 0x14, ln * 2)).decode("utf-16-le") if sp and ln >= 0 else None
-                        if key == arg:
+                    if arg.startswith("#"):
+                        if n == int(arg[1:]):
                             found = e; break
-                    else:
-                        key = struct.unpack("<q" if elem_size(res, ktype) == 8 else "<i", await read_(read, e + 8, elem_size(res, ktype) if elem_size(res, ktype) == 8 else 4))[0]
-                        if key == int(arg, 0):
-                            found = e; break
+                    elif arg in await dict_key_names(res, rt, read, ktype, e):
+                        found = e; break
                 if found is None:
                     return None, f"key {arg} not in dictionary ({count} entries)"
                 addr, ftype = found + 0x10, vtype
                 if trace is not None:
                     trace.append(f"{{{arg}}} @ {addr:#x} ({vtype}, entry {n} of {count})")
     return addr, ftype
+
+
+KEY_ID_FIELDS = ("_guid", "guid", "_id", "id", "_name", "name", "key", "_key", "Id", "ID", "Name")
+
+
+async def dict_key_names(res, rt, read, ktype, entry):
+    """Ways to name the key of a Dictionary entry: int keys -> ['42'], string keys -> ['text'], object keys ->
+    ['_guid=abc', 'name=xyz', ...] from identifier-like string/int fields of the key object (first one is used for output)."""
+    if ktype == "string":
+        return [await read_string(read, await read_u64(read, entry + 8))]
+    if ktype in PRIM or (res.find_type(ktype) or Type("class", "", "", [], 0)).kind == "enum":
+        fmt = PRIM.get(ktype, ("i", 4))
+        if ktype not in PRIM:
+            fmt = PRIM.get(res.find_type(ktype).enum_base, ("i", 4))
+        return [str(struct.unpack("<" + fmt[0], await read_(read, entry + 8, fmt[1]))[0])]
+    kobj = await read_u64(read, entry + 8)
+    if not kobj:
+        return []
+    kt = await rt.object_type_live(read, kobj) or res.find_type(ktype)
+    out = []
+    c = kt
+    while c:
+        for off, (ft, fn) in c.fields.items():
+            if fn in KEY_ID_FIELDS and ft in ("string", "int", "uint", "long"):
+                try:
+                    if ft == "string":
+                        v = await read_string(read, await read_u64(read, kobj + off))
+                    else:
+                        v = str(struct.unpack("<" + PRIM[ft][0], await read_(read, kobj + off, PRIM[ft][1]))[0])
+                    out.append(f"{fn}={v}")
+                except LookupError:
+                    pass
+        c = res.find_type(c.bases[0], c.ns) if c.bases and c.bases[0] else None
+    return out
+
+
+async def read_string(read, sp):
+    """Il2CppString: length at 0x10, UTF-16 from 0x14."""
+    if not sp:
+        return ""
+    ln = struct.unpack("<i", await read_(read, sp + 0x10, 4))[0]
+    return (await read_(read, sp + 0x14, ln * 2)).decode("utf-16-le", "replace") if 0 <= ln < 4096 else ""
 
 
 async def read_(read, va, n):
@@ -534,21 +585,15 @@ async def children(res, rt, read, path, addr, ftype):
         return out
     if base == "Dictionary":
         ktype, vtype = gargs
-        if ktype not in ("int", "uint", "long", "ulong", "string"):
-            return []
         try:
             entries = await read_u64(read, obj + 0x18)
             count = struct.unpack("<i", await read_(read, obj + 0x20, 4))[0]
             for n in range(min(count, 256)):
                 e = entries + 0x20 + n * 0x18
-                if ktype == "string":
-                    sp = await read_u64(read, e + 8)
-                    ln = struct.unpack("<i", await read_(read, sp + 0x10, 4))[0] if sp else -1
-                    key = (await read_(read, sp + 0x14, ln * 2)).decode("utf-16-le") if sp and 0 <= ln < 256 else None
-                else:
-                    key = struct.unpack("<q" if elem_size(res, ktype) == 8 else "<i", await read_(read, e + 8, elem_size(res, ktype)))[0]
-                if key is not None and await read_u64(read, e + 0x10):
-                    out.append((f"{path}{{{key}}}", e + 0x10, vtype, 0))
+                if not await read_u64(read, e + 0x10):
+                    continue
+                names = await dict_key_names(res, rt, read, ktype, e)
+                out.append((f"{path}{{{names[0] if names else '#%d' % n}}}", e + 0x10, vtype, 0))
         except LookupError:
             pass
         return out

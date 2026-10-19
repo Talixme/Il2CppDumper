@@ -25,6 +25,10 @@ class Diff:
         self.rt = il2live.Runtime(self.a, self.types)
         self.res = il2live.Resolver(self.rt)
         self.depth, self.max_parents = depth, max_parents
+
+        async def aread(va, n):
+            return self.a.read(va, n)
+        self.aread = aread
         self.klass_arr = self.rt.klass_arr
         # static field blocks: start -> (Type, size)
         self.statics = {}
@@ -98,7 +102,7 @@ class Diff:
             c = self.res.find_type(c.bases[0], c.ns) if c.bases and c.bases[0] else None
         return None, None
 
-    def step_up(self, va):
+    async def step_up(self, va):
         """What holds the pointer/value at va: ('static', path) | ('obj', object start, suffix piece) | None.
         Dictionary entries and List buffers are collapsed into {key} / [i] on the owning container."""
         root = self.static_root(va)
@@ -116,22 +120,14 @@ class Diff:
                 i, rest = divmod(va - start - 0x20, 0x18)
                 if rest != 0x10 or i >= length:
                     return None
-                key = struct.unpack("<q", self.a.read(start + 0x20 + i * 0x18 + 8, 8))[0]
                 dicts = [r for r in self.refs(start) if (o := self.owner(r)) and r - o[0] == 0x18]
                 if not dicts:
                     return None
                 d = self.owner(dicts[0])[0]
                 kt = self.rt.type_of_klass(self.a.u64(d))
                 if kt and kt.name.startswith("Dictionary"):
-                    ktype = self.dict_key_type(d)
-                    if ktype == "string":
-                        sp = self.a.u64(start + 0x20 + i * 0x18 + 8)
-                        ln = struct.unpack("<i", self.a.read(sp + 0x10, 4))[0] if sp else -1
-                        key = self.a.read(sp + 0x14, ln * 2).decode("utf-16-le") if sp and 0 <= ln < 256 else key
-                    else:
-                        key = key & 0xFFFFFFFF if key >= 0 else key
-                        key = struct.unpack("<i", struct.pack("<I", key & 0xFFFFFFFF))[0]
-                    return ("obj", d, f"{{{key}}}")
+                    names = await il2live.dict_key_names(self.res, self.rt, self.aread, self.dict_key_type(d), start + 0x20 + i * 0x18)
+                    return ("obj", d, f"{{{names[0] if names else '#%d' % i}}}")
                 return None
             es = il2live.elem_size(self.res, elem)
             i, rest = divmod(va - start - 0x20, es)
@@ -171,7 +167,7 @@ class Diff:
                         return split_generic(ft)[1][0]
         return "int"
 
-    def paths_to(self, va, max_paths):
+    async def paths_to(self, va, max_paths):
         """Static-rooted paths that reach the value at va, shortest first."""
         done, out = [], []
         frontier = [(va, "")]
@@ -179,7 +175,7 @@ class Diff:
         for level in range(self.depth):
             nxt = []
             for addr, suffix in frontier:
-                s = self.step_up(addr)
+                s = await self.step_up(addr)
                 if not s:
                     continue
                 if s[0] == "static":
@@ -221,7 +217,7 @@ async def amain(a):
     hits = diff.scan(a.eq[0], a.eq[1])
     print(f"{len(hits)} locations are {a.eq[0]} in {a.a} and {a.eq[1]} in {a.b}", file=sys.stderr)
     for va, kind in hits[:a.hits]:
-        paths = diff.paths_to(va, a.paths)
+        paths = await diff.paths_to(va, a.paths)
         if not paths:
             print(f"# {va:#x} ({kind}): no static root within {a.depth} hops", file=sys.stderr)
         for p in paths:
