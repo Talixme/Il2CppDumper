@@ -641,11 +641,14 @@ async def children(res, rt, read, path, addr, ftype):
     out = []
     if ftype.endswith("[]") or base == "List":
         etype = gargs[0] if base == "List" else ftype[:-2]
-        if base == "List":
-            obj = await read_u64(read, obj + 0x10)
-            if not obj:
-                return []
-        size = struct.unpack("<i", await read_(read, obj + 0x18, 4))[0]
+        try:
+            if base == "List":
+                obj = await read_u64(read, obj + 0x10)
+                if not obj:
+                    return []
+            size = struct.unpack("<i", await read_(read, obj + 0x18, 4))[0]
+        except LookupError:        # stale / garbage pointer in a field that is typed as a list: nothing to walk
+            return []
         es = elem_size(res, etype)
         for i in range(min(size, 16)):
             out.append((f"{path}[{i}]", obj + 0x20 + i * es, etype, 0))
