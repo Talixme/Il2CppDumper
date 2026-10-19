@@ -33,6 +33,11 @@ Decrypted PS4/PS5 `Il2CppUserAssemblies.prx` (ELF `e_type` 0xFE18, no section he
 * `ps4tools/il2mem.py` pulls `global-metadata.dat` and a loadable image of the module out of a ps4debug memory dump
   (`ps4dump.py` from ps4-unreal-dumper), so a running game is enough: no prx/metadata files, no decryption.
   Run the dumper on the two outputs with `NoRedirectedPointer: true` and the printed base as dump address.
+* `ps4tools/il2live.py` reads or writes a value in the running game by a path that starts at a static field, e.g.
+  `GameStateManager::_instance._mainCharacterEntity.componentCache{611004928}.manas[0]._currentManaStatObject.baseValue`
+  (`::` static root, `.field`, `[i]` array/List element, `{key}` Dictionary lookup, `:Class` downcast, real classes are
+  read from the object headers). Without `--host` it resolves against the memory dump, so paths can be checked offline;
+  `--find word|value` lists paths from every static field. Needs numpy, live access needs the `ps4debug` module.
 * When LTO folded `Il2CppCodeRegistration` into code (seen in Blasphemous 2), it is reconstructed from the
   code gen module table, the generic method pointer table and the invoker table (`Utils/LtoSearch.cs`).
 

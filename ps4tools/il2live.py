@@ -1,0 +1,549 @@
+"""Read / write a value in a running Unity IL2CPP game (PS4/PS5) by a path that starts at a static field.
+
+    python il2live.py <dumpdir> "GameStateManager::_instance._mainCharacterEntity.componentCache{611004928}.manas[0]._currentManaStatObject.baseValue"
+    python il2live.py <dumpdir> "<path>" --host 192.168.1.49            # live read (ps4debug)
+    python il2live.py <dumpdir> "<path>" --host 192.168.1.49 --set 999  # live write
+    python il2live.py <dumpdir> --find mana                              # paths from all static fields whose field name contains "mana"
+    python il2live.py <dumpdir> --find 50.0 --depth 4                    # ... whose value is 50.0
+
+<dumpdir> holds dump.bin + dump.json (ps4dump.py, taken in the running game session) and sdk/dump.cs from Il2CppDumper
+(il2mem.py builds the sdk from the same dump). Without --host every read comes from the dump.
+
+Path syntax (talixme's GUI passes it through unchanged):
+    Class::field        static field of Class (root), nested classes as Outer.Inner, namespace optional: Ns.Class::field
+    .field              instance field, base class fields included
+    [i]                 element i of an array or List<T>
+    {key}               Dictionary<K,V> value for key (int or string key)
+    :Class              downcast (normally automatic: the object's real class is read from its klass pointer)
+
+Layout facts (measured on PS4/PS5 dumps, metadata v29/v31, x64):
+    object header 0x10 (klass*, monitor*), dump.cs class field offsets include it, struct offsets do not
+    Il2CppClass: name 0x10, namespace 0x18, declaringType 0x50, parent 0x58, static_fields 0xB8
+    Il2CppArray: bounds 0x10, max_length 0x18, elements from 0x20; List<T>: _items 0x10, _size 0x18
+    Dictionary<K,V>: _entries 0x18, _count 0x20; Entry = {int hashCode, int next, K key @8, V value @0x10}, 0x18 bytes
+    String: length 0x10, UTF-16 chars from 0x14
+    dump.cs gives 0x0 for every field of an open generic class, hence the fixed tables above
+"""
+import argparse, json, mmap, os, re, struct, sys
+import numpy as np
+
+HEADER = 0x10
+KLASS_NAME, KLASS_NS, KLASS_DECLARING, KLASS_PARENT, KLASS_STATICS = 0x10, 0x18, 0x50, 0x58, 0xB8
+PRIM = dict(bool=("?", 1), sbyte=("b", 1), byte=("B", 1), short=("h", 2), ushort=("H", 2), int=("i", 4), uint=("I", 4),
+            long=("q", 8), ulong=("Q", 8), float=("f", 4), double=("d", 8), char=("H", 2), IntPtr=("Q", 8), UIntPtr=("Q", 8))
+MODS = {"public", "private", "internal", "protected", "static", "readonly", "const", "volatile", "abstract", "sealed", "new", "unsafe"}
+TYPE_RE = re.compile(r"^(?P<mods>(?:\w+\s+)*?)(?P<kind>class|struct|enum|interface)\s+(?P<name>\S+)(?:\s*:\s*(?P<bases>.*?))?\s*// TypeDefIndex: (?P<idx>\d+)")
+FIELD_RE = re.compile(r"^\t(?P<decl>.+?)(?: = (?P<val>.*?))?; // 0x(?P<off>[0-9A-Fa-f]+)$")
+
+
+# ---- dump.cs ---------------------------------------------------------------------------------------------------
+class Type:
+    def __init__(self, kind, name, ns, bases):
+        self.kind, self.name, self.ns, self.bases = kind, name, ns, bases
+        self.fields, self.statics, self.enum_base = {}, {}, "int"      # offset -> (type, name)
+
+    @property
+    def full(self):
+        return f"{self.ns}.{self.name}" if self.ns else self.name
+
+
+def parse_dump_cs(path):
+    """-> {full name: Type}; full name = Namespace.Outer.Inner"""
+    types, ns, cur = {}, "", None
+    for line in open(path, encoding="utf-8", errors="replace"):
+        line = line.rstrip("\r\n")
+        if line.startswith("// Namespace: "):
+            ns = line[14:].strip(); continue
+        m = TYPE_RE.match(line)
+        if m:
+            bases = [b.strip() for b in m["bases"].split(",")] if m["bases"] else []
+            cur = Type(m["kind"], m["name"], ns, bases); types[cur.full] = cur; continue
+        if cur is None:
+            continue
+        if line == "}" or line.startswith("\t// Methods") or line.startswith("\t// Properties"):
+            cur = None; continue
+        m = FIELD_RE.match(line)
+        if m:
+            off = int(m["off"], 16)
+            if off >= 0x1000000:
+                continue                                    # thread statics carry marker offsets
+            words = m["decl"].split(" ")
+            i = 0
+            while i < len(words) and words[i] in MODS:
+                i += 1
+            mods, typ, name = set(words[:i]), " ".join(words[i:-1]), words[-1]
+            if cur.kind == "enum" and name == "value__":
+                cur.enum_base = typ
+            elif "static" in mods:
+                cur.statics[off] = (typ, name)
+            else:
+                cur.fields[off] = (typ, name)
+    return types
+
+
+def split_generic(t):
+    """'Dictionary<int, Component>' -> ('Dictionary', ['int', 'Component']); nested generics stay intact."""
+    if "<" not in t:
+        return t, []
+    base, rest = t[:t.index("<")], t[t.index("<") + 1:-1]
+    args, depth, cur = [], 0, ""
+    for ch in rest:
+        if ch == "<": depth += 1
+        if ch == ">": depth -= 1
+        if ch == "," and depth == 0:
+            args.append(cur.strip()); cur = ""
+        else:
+            cur += ch
+    args.append(cur.strip())
+    return base, args
+
+
+# ---- memory dump --------------------------------------------------------------------------------------------------
+class Dump:
+    def __init__(self, d, json_name="dump.json"):
+        info = json.load(open(os.path.join(d, json_name)))
+        self.regs = sorted(info["regions"], key=lambda r: r["start"])
+        self.path = os.path.join(d, json_name.replace(".json", ".bin"))
+        self.fh = open(self.path, "rb")
+        self.m = mmap.mmap(self.fh.fileno(), 0, access=mmap.ACCESS_READ)
+        self.starts = np.array([r["start"] for r in self.regs]); self.ends = np.array([r["end"] for r in self.regs])
+        self.offs = np.array([r["offset"] for r in self.regs])
+        self.pid, self.title = info.get("pid"), info.get("title_id")
+
+    def off(self, va):
+        i = np.searchsorted(self.starts, va, side="right") - 1
+        if i >= 0 and va < self.ends[i]:
+            return int(self.offs[i] + va - self.starts[i])
+        return None
+
+    def read(self, va, n):
+        o = self.off(va)
+        return self.m[o:o + n] if o is not None else None
+
+    def u64(self, va):
+        b = self.read(va, 8)
+        return struct.unpack("<Q", b)[0] if b else None
+
+    def cstr(self, va, n=96):
+        b = self.read(va, n)
+        return b.split(b"\0")[0].decode("latin-1") if b else None
+
+    def module_base(self, name):
+        return min(r["start"] for r in self.regs if r["name"] == name)
+
+    def arrays(self, min_size=32):
+        for r in self.regs:
+            size = r["end"] - r["start"]
+            if size >= min_size:
+                yield r, np.frombuffer(self.m, dtype=np.uint64, count=size // 8, offset=r["offset"])
+
+
+# ---- Il2Cpp runtime structures in the dump -------------------------------------------------------------------------
+class Runtime:
+    def __init__(self, dump, types):
+        self.d, self.types = dump, types
+        m = dump.m
+        i = m.find(b"\xaf\x1b\xb1\xfa")
+        while not (16 <= struct.unpack_from("<I", m, i + 4)[0] <= 64 and i % 16 == 0):
+            i = m.find(b"\xaf\x1b\xb1\xfa", i + 4)
+        r = [x for x in dump.regs if x["offset"] <= i < x["offset"] + x["end"] - x["start"]][0]
+        self.meta = r["start"] + i - r["offset"]
+        hdr = [struct.unpack_from("<ii", m, i + 8 + k * 8) for k in range(31)]
+        self.str0, self.str1 = self.meta + hdr[2][0], self.meta + hdr[2][0] + hdr[2][1]
+        td_off, td_size = hdr[19]
+        cache = dump.path + ".klasses.json"            # the two numpy passes take ~50 s on a 3 GB dump
+        try:
+            c = json.load(open(cache))
+            assert c["size"] == os.path.getsize(dump.path)
+            self.klasses = {int(k): v for k, v in c["klasses"].items()}
+        except Exception:
+            name_vas = {self.str0 + struct.unpack_from("<i", m, i + td_off + k * 0x58)[0] for k in range(td_size // 0x58)}
+            self.klasses = self.find_klasses(np.array(sorted(name_vas), dtype=np.uint64))
+            json.dump({"size": os.path.getsize(dump.path), "klasses": self.klasses}, open(cache, "w"))
+        self.klass_arr = np.array(sorted(self.klasses), dtype=np.uint64)
+        self.by_full = {}
+        for k in self.klasses:
+            self.by_full.setdefault(self.full_name(k), []).append(k)
+
+    def find_klasses(self, name_arr):
+        """pass 1: name/namespace point into the metadata string table; pass 2: same image pointer as pass 1 classes
+        (arrays and generic instances carry runtime built names on the heap)."""
+        d, out = self.d, {}
+        for r, a in d.arrays():
+            for idx in np.nonzero(np.isin(a, name_arr))[0]:
+                if idx >= 2 and idx + 1 < len(a) and self.str0 <= int(a[idx + 1]) < self.str1:
+                    out[r["start"] + int(idx) * 8 - KLASS_NAME] = d.cstr(int(a[idx]))
+        images = {}
+        for k in out:
+            images[d.u64(k)] = images.get(d.u64(k), 0) + 1
+        image_arr = np.array([i for i, c in images.items() if c >= 50], dtype=np.uint64)
+        for r, a in d.arrays():
+            for idx in np.nonzero(np.isin(a, image_arr))[0]:
+                k = r["start"] + int(idx) * 8
+                if k in out or idx + 3 >= len(a) or not (self.str0 <= int(a[idx + 3]) < self.str1):
+                    continue
+                s = d.cstr(int(a[idx + 2]))
+                if s and 1 < len(s) < 200 and s.isprintable():
+                    out[k] = s
+        return out
+
+    def full_name(self, k):
+        """Namespace.Outer.Inner like dump.cs; array / generic instance names stay as the runtime built them."""
+        name = self.klasses[k]
+        decl = self.d.u64(k + KLASS_DECLARING)
+        if decl and decl in self.klasses:
+            return f"{self.full_name(decl)}.{name}"
+        ns = self.d.cstr(self.d.u64(k + KLASS_NS)) or ""
+        return f"{ns}.{name}" if ns else name
+
+    def klass_of(self, full):
+        ks = self.by_full.get(full)
+        if not ks:
+            short = full.split(".")[-1]
+            ks = [k for f, l in self.by_full.items() if f.endswith("." + short) or f == short for k in l]
+        if not ks:
+            return None
+        if len(ks) > 1:
+            print(f"warning: {len(ks)} runtime classes named {full}, using the first", file=sys.stderr)
+        return ks[0]
+
+    def type_of_klass(self, k):
+        """dump.cs Type for a runtime class (generic instances map to their open definition)."""
+        full = self.full_name(k)
+        if full in self.types:
+            return self.types[full]
+        short = full.split(".")[-1]
+        base, _ = split_generic(short)
+        cands = [t for t in self.types.values() if t.name.split("<")[0] == base or t.name == short]
+        return cands[0] if cands else None
+
+    def object_type(self, obj):
+        k = self.d.u64(obj)
+        return self.type_of_klass(k) if k in self.klasses else None
+
+
+# ---- path resolution -------------------------------------------------------------------------------------------------
+class Resolver:
+    def __init__(self, rt):
+        self.rt, self.types = rt, rt.types
+
+    def find_type(self, name, hint_ns=""):
+        if name in self.types:
+            return self.types[name]
+        if hint_ns and f"{hint_ns}.{name}" in self.types:
+            return self.types[f"{hint_ns}.{name}"]
+        base, _ = split_generic(name)
+        cands = [t for f, t in self.types.items() if f == base or f.endswith("." + base) or t.name.split("<")[0] == base]
+        same = [t for t in cands if t.ns == hint_ns]
+        return (same or cands)[0] if cands else None
+
+    def field(self, t, name):
+        """(offset, type string, owner Type) walking base classes."""
+        c = t
+        while c:
+            for off, (ft, fn) in c.fields.items():
+                if fn == name:
+                    return off, ft, c
+            c = self.find_type(c.bases[0], c.ns) if c.bases and c.bases[0] else None
+        return None
+
+    def tokens(self, path):
+        head, sep, rest = path.partition("::")
+        if not sep:
+            sys.exit("path must start at a static field: Class::field...")
+        segs = [("static", head, rest.split(".")[0].split("[")[0].split("{")[0])]
+        first = rest.split(".")[0]
+        tail = first[len(segs[0][2]):]
+        for s in [tail] + rest.split(".")[1:]:
+            m = re.match(r"^([A-Za-z_<>,`0-9 ]*)((?:\[[^\]]*\]|\{[^}]*\}|:[A-Za-z_.0-9]+)*)$", s)
+            if not m:
+                sys.exit(f"cannot parse path segment '{s}'")
+            if m.group(1):
+                segs.append(("field", m.group(1)))
+            for x in re.findall(r"\[[^\]]*\]|\{[^}]*\}|:[A-Za-z_.0-9]+", m.group(2)):
+                segs.append(("index", x[1:-1]) if x[0] == "[" else ("key", x[1:-1]) if x[0] == "{" else ("cast", x[1:]))
+        return segs
+
+
+def elem_size(res, tname):
+    if tname in PRIM:
+        return PRIM[tname][1]
+    t = res.find_type(tname)
+    if t and t.kind == "enum":
+        return PRIM.get(t.enum_base, ("i", 4))[1]
+    if t and t.kind == "struct" and t.fields:
+        return (max(t.fields) + elem_size(res, t.fields[max(t.fields)][0]) + 7) & ~7
+    return 8
+
+
+async def follow(res, rt, read, path, auto_cast=True, trace=None):
+    """Resolve the path; returns (address of the final field, type string). read(va, n) -> bytes or None."""
+    segs = res.tokens(path)
+    kind, cls_name, sname = segs[0]
+    t = res.find_type(cls_name)
+    if not t:
+        sys.exit(f"class {cls_name} not in dump.cs")
+    k = rt.klass_of(t.full)
+    if not k:
+        sys.exit(f"no runtime class for {t.full} in the dump (not loaded yet?)")
+    statics = rt.d.u64(k + KLASS_STATICS)
+    if not statics:
+        sys.exit(f"{t.full} has no static field block")
+    hit = [(o, ft) for o, (ft, fn) in t.statics.items() if fn == sname]
+    if not hit:
+        sys.exit(f"{t.full} has no static field {sname}; statics: {[fn for _, (_, fn) in t.statics.items()]}")
+    addr, ftype = statics + hit[0][0], hit[0][1]
+    if trace is not None:
+        trace.append(f"{t.full}::{sname} @ {addr:#x} ({ftype})")
+    cur_t = None                                     # type of the object we are inside, once dereferenced
+    for op, arg in segs[1:]:
+        if op == "cast":
+            cur_t = res.find_type(arg) or sys.exit(f"class {arg} not found")
+            continue
+        # dereference the value at addr to get the object we are about to enter
+        if op in ("field", "index", "key"):
+            base, gargs = split_generic(ftype)
+            is_struct_inline = cur_t is not None and ftype not in PRIM and (ct := res.find_type(ftype, cur_t.ns)) and ct.kind == "struct" and not ftype.endswith("[]")
+            if op == "field" and is_struct_inline:
+                obj, cur_t = addr, ct                   # value type inline: no pointer hop
+            else:
+                obj = await read_u64(read, addr)
+                if not obj:
+                    return None, f"null at {addr:#x}"
+                if op == "field":
+                    cur_t = (rt.object_type(obj) if auto_cast else None) or res.find_type(ftype, cur_t.ns if cur_t else "")
+                    if cur_t is None:
+                        sys.exit(f"unknown class for field type {ftype}")
+            if op == "field":
+                f = res.field(cur_t, arg)
+                if not f:
+                    sys.exit(f"{cur_t.full} has no field {arg}; fields: {[fn for _, (_, fn) in cur_t.fields.items()][:30]}")
+                off, ftype, owner = f
+                addr = obj + off
+                if trace is not None:
+                    trace.append(f".{arg} @ {addr:#x} ({ftype}) in {cur_t.full}")
+                continue
+            if op == "index":
+                i = int(arg, 0)
+                if base == "List":
+                    size = struct.unpack("<i", await read_(read, obj + 0x18, 4))[0]
+                    obj = await read_u64(read, obj + 0x10)
+                    etype = gargs[0]
+                else:
+                    etype = ftype[:-2] if ftype.endswith("[]") else ftype
+                    size = struct.unpack("<i", await read_(read, obj + 0x18, 4))[0]
+                if i >= size:
+                    return None, f"index {i} >= length {size}"
+                es = elem_size(res, etype)
+                addr, ftype = obj + 0x20 + i * es, etype
+                if trace is not None:
+                    trace.append(f"[{i}] @ {addr:#x} ({etype}, {size} elements)")
+                continue
+            if op == "key":
+                ktype, vtype = gargs[0], gargs[1]
+                entries = await read_u64(read, obj + 0x18)
+                count = struct.unpack("<i", await read_(read, obj + 0x20, 4))[0]
+                found = None
+                for n in range(count):
+                    e = entries + 0x20 + n * 0x18
+                    if ktype == "string":
+                        sp = await read_u64(read, e + 8)
+                        ln = struct.unpack("<i", await read_(read, sp + 0x10, 4))[0] if sp else -1
+                        key = (await read_(read, sp + 0x14, ln * 2)).decode("utf-16-le") if sp and ln >= 0 else None
+                        if key == arg:
+                            found = e; break
+                    else:
+                        key = struct.unpack("<q" if elem_size(res, ktype) == 8 else "<i", await read_(read, e + 8, elem_size(res, ktype) if elem_size(res, ktype) == 8 else 4))[0]
+                        if key == int(arg, 0):
+                            found = e; break
+                if found is None:
+                    return None, f"key {arg} not in dictionary ({count} entries)"
+                addr, ftype = found + 0x10, vtype
+                if trace is not None:
+                    trace.append(f"{{{arg}}} @ {addr:#x} ({vtype}, entry {n} of {count})")
+    return addr, ftype
+
+
+async def read_(read, va, n):
+    b = await read(va, n)
+    if b is None or len(b) < n:
+        raise LookupError(f"cannot read {n} bytes at {va:#x}")
+    return b
+
+
+async def read_u64(read, va):
+    return struct.unpack("<Q", await read_(read, va, 8))[0]
+
+
+def value_format(res, ftype):
+    if ftype in PRIM:
+        return PRIM[ftype][0]
+    t = res.find_type(ftype)
+    if t and t.kind == "enum":
+        return PRIM.get(t.enum_base, ("i", 4))[0]
+    return "Q"                                       # pointers / unknown: raw qword
+
+
+async def read_value(res, read, addr, ftype):
+    fmt = value_format(res, ftype)
+    raw = await read_(read, addr, struct.calcsize(fmt))
+    v = struct.unpack("<" + fmt, raw)[0]
+    return f"{v:#x}" if fmt == "Q" else v
+
+
+# ---- --find: BFS from every static field ------------------------------------------------------------------------------
+async def find(res, rt, read, word, depth, max_paths=200):
+    """Paths from static roots to fields whose name contains `word` or whose value equals it. Prints path<TAB>type<TAB>value."""
+    try:
+        want_val = float(word)
+    except ValueError:
+        want_val = None
+    out, seen = [], set()
+    roots = []
+    for t in res.types.values():
+        if not t.statics or t.kind != "class":
+            continue
+        k = rt.klass_of(t.full) if t.full in rt.by_full else None
+        if not k:
+            continue
+        statics = rt.d.u64(k + KLASS_STATICS)
+        if statics:
+            for off, (ft, fn) in t.statics.items():
+                roots.append((f"{t.full}::{fn}", statics + off, ft, 0))
+    frontier = roots
+    for level in range(depth + 1):
+        nxt = []
+        for path, addr, ftype, _ in frontier:
+            await match(res, rt, read, path, addr, ftype, word, want_val, out)
+            if level == depth or len(out) >= max_paths:
+                continue
+            for child in await children(res, rt, read, path, addr, ftype):
+                if child[1] not in seen:
+                    seen.add(child[1]); nxt.append(child)
+        frontier = nxt
+        if not frontier or len(out) >= max_paths:
+            break
+    for line in sorted(out, key=lambda s: s.count(".")):
+        print(line)
+
+
+async def match(res, rt, read, path, addr, ftype, word, want_val, out):
+    fmt = value_format(res, ftype)
+    if fmt == "Q":
+        return
+    try:
+        v = struct.unpack("<" + fmt, await read_(read, addr, struct.calcsize(fmt)))[0]
+    except LookupError:
+        return
+    name = re.sub(r"[\[{].*", "", path.rsplit(".", 1)[-1].split("::")[-1])
+    words = [w.lower() for w in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", name)]   # camelCase / _snake -> words
+    if (want_val is None and word.lower() in words) or (want_val is not None and v == want_val):
+        out.append(f"{path}\t{ftype}\t{v}")
+
+
+async def children(res, rt, read, path, addr, ftype):
+    """Objects reachable from the field at addr: pointer fields -> their fields; arrays/lists -> elements (first 16)."""
+    if ftype in PRIM:
+        return []
+    base, gargs = split_generic(ftype)
+    try:
+        obj = await read_u64(read, addr)
+    except LookupError:
+        return []
+    if not obj or rt.d.off(obj) is None:
+        return []
+    out = []
+    if ftype.endswith("[]") or base == "List":
+        etype = gargs[0] if base == "List" else ftype[:-2]
+        if base == "List":
+            obj = await read_u64(read, obj + 0x10)
+            if not obj:
+                return []
+        size = struct.unpack("<i", await read_(read, obj + 0x18, 4))[0]
+        es = elem_size(res, etype)
+        for i in range(min(size, 16)):
+            out.append((f"{path}[{i}]", obj + 0x20 + i * es, etype, 0))
+        return out
+    if base == "Dictionary":
+        ktype, vtype = gargs
+        if ktype not in ("int", "uint", "long", "ulong", "string"):
+            return []
+        try:
+            entries = await read_u64(read, obj + 0x18)
+            count = struct.unpack("<i", await read_(read, obj + 0x20, 4))[0]
+            for n in range(min(count, 256)):
+                e = entries + 0x20 + n * 0x18
+                if ktype == "string":
+                    sp = await read_u64(read, e + 8)
+                    ln = struct.unpack("<i", await read_(read, sp + 0x10, 4))[0] if sp else -1
+                    key = (await read_(read, sp + 0x14, ln * 2)).decode("utf-16-le") if sp and 0 <= ln < 256 else None
+                else:
+                    key = struct.unpack("<q" if elem_size(res, ktype) == 8 else "<i", await read_(read, e + 8, elem_size(res, ktype)))[0]
+                if key is not None and await read_u64(read, e + 0x10):
+                    out.append((f"{path}{{{key}}}", e + 0x10, vtype, 0))
+        except LookupError:
+            pass
+        return out
+    t = rt.object_type(obj) or res.find_type(ftype)
+    if not t or t.kind not in ("class", "struct") or t.ns.startswith(("System", "UnityEngine", "TMPro", "Unity.")):
+        return []
+    c = t
+    while c:
+        for off, (ft, fn) in c.fields.items():
+            out.append((f"{path}.{fn}", obj + off, ft, 0))
+        c = res.find_type(c.bases[0], c.ns) if c.bases and c.bases[0] else None
+    return out
+
+
+# ---- main ---------------------------------------------------------------------------------------------------------------
+async def amain(a):
+    dump = Dump(a.dumpdir, a.json)
+    types = parse_dump_cs(os.path.join(a.dumpdir, "sdk", "dump.cs"))
+    rt = Runtime(dump, types)
+    res = Resolver(rt)
+    print(f"{len(types)} types, {len(rt.klasses)} runtime classes, metadata {rt.meta:#x}", file=sys.stderr)
+
+    if a.host:
+        import ps4debug
+        dbg = ps4debug.PS4Debug(a.host)
+        pid = dump.pid
+        async def read(va, n):
+            return await dbg.read_memory(pid, va, n)
+    else:
+        async def read(va, n):
+            return dump.read(va, n)
+
+    if a.find:
+        await find(res, rt, read, a.find, a.depth)
+        return
+    trace = []
+    addr, ftype = await follow(res, rt, read, a.path, trace=trace)
+    for line in trace:
+        print("  " + line, file=sys.stderr)
+    if addr is None:
+        sys.exit(f"path ends early: {ftype}")
+    val = await read_value(res, read, addr, ftype)
+    print(f"{a.path}\t{ftype}\t{val}\t@ {addr:#x}")
+    if a.set is not None:
+        if not a.host:
+            sys.exit("--set needs --host (writing into a dump file makes no sense)")
+        fmt = value_format(res, ftype)
+        new = float(a.set) if fmt in "fd" else int(a.set, 0) if fmt != "?" else a.set.lower() in ("1", "true")
+        await dbg.write_memory(pid, addr, struct.pack("<" + fmt, new))
+        print(f"written, now: {await read_value(res, read, addr, ftype)}")
+
+
+if __name__ == "__main__":
+    import asyncio
+    ap = argparse.ArgumentParser()
+    ap.add_argument("dumpdir")
+    ap.add_argument("path", nargs="?")
+    ap.add_argument("--json", default="dump.json", help="dump json name inside dumpdir (default dump.json)")
+    ap.add_argument("--host", help="PS4/PS5 IP for live access via ps4debug (default: read from the dump)")
+    ap.add_argument("--set", help="value to write (live only)")
+    ap.add_argument("--find", help="field name substring or numeric value to search from all static fields")
+    ap.add_argument("--depth", type=int, default=3, help="pointer hops for --find (default 3)")
+    a = ap.parse_args()
+    if not a.path and not a.find:
+        ap.error("path or --find required")
+    asyncio.run(amain(a))
