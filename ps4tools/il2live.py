@@ -34,7 +34,7 @@ KLASS_NAME, KLASS_NS, KLASS_DECLARING, KLASS_PARENT, KLASS_STATICS = 0x10, 0x18,
 PRIM = dict(bool=("?", 1), sbyte=("b", 1), byte=("B", 1), short=("h", 2), ushort=("H", 2), int=("i", 4), uint=("I", 4),
             long=("q", 8), ulong=("Q", 8), float=("f", 4), double=("d", 8), char=("H", 2), IntPtr=("Q", 8), UIntPtr=("Q", 8))
 MODS = {"public", "private", "internal", "protected", "static", "readonly", "const", "volatile", "abstract", "sealed", "new", "unsafe"}
-TYPE_RE = re.compile(r"^(?P<mods>(?:\w+\s+)*?)(?P<kind>class|struct|enum|interface)\s+(?P<name>\S+)(?:\s*:\s*(?P<bases>.*?))?\s*// TypeDefIndex: (?P<idx>\d+)")
+TYPE_RE = re.compile(r"^(?P<mods>(?:\w+\s+)*?)(?P<kind>class|struct|enum|interface)\s+(?P<name>[^\s<]+(?:<[^>]*>)?)(?:\s*:\s*(?P<bases>.*?))?\s*// TypeDefIndex: (?P<idx>\d+)")
 FIELD_RE = re.compile(r"^\t(?P<decl>.+?)(?: = (?P<val>.*?))?; // 0x(?P<off>[0-9A-Fa-f]+)$")
 
 
@@ -240,7 +240,7 @@ class Runtime:
         if full in self.types:
             return self.types[full]
         short = full.split(".")[-1]
-        base, _ = split_generic(short)
+        base = split_generic(short)[0].split("`")[0]          # runtime names generic instances Dictionary`2, dump.cs Dictionary<TKey, TValue>
         cands = [t for t in self.types.values() if t.name.split("<")[0] == base or t.name == short]
         return cands[0] if cands else None
 
@@ -268,7 +268,7 @@ class Runtime:
             return None
         if full in self.types:
             return self.types[full]
-        base, _ = split_generic(full.split(".")[-1])
+        base = split_generic(full.split(".")[-1])[0].split("`")[0]
         cands = [t for t in self.types.values() if t.name.split("<")[0] == base]
         return cands[0] if cands else None
 

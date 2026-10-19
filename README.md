@@ -38,6 +38,8 @@ Decrypted PS4/PS5 `Il2CppUserAssemblies.prx` (ELF `e_type` 0xFE18, no section he
   (`::` static root, `.field`, `[i]` array/List element, `{key}` Dictionary lookup, `:Class` downcast, real classes are
   read from the object headers). Without `--host` it resolves against the memory dump, so paths can be checked offline;
   `--find word|value` lists paths from every static field. Needs numpy, live access needs the `ps4debug` module.
+* `ps4tools/il2diff.py` compares two dumps of one game session (`--eq 50 77`: value before and after) and turns every
+  hit into an il2live path by walking the object references back to a static field, verified against both dumps.
 * When LTO folded `Il2CppCodeRegistration` into code (seen in Blasphemous 2), it is reconstructed from the
   code gen module table, the generic method pointer table and the invoker table (`Utils/LtoSearch.cs`).
 
