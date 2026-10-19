@@ -30,6 +30,9 @@ Decrypted PS4/PS5 `Il2CppUserAssemblies.prx` (ELF `e_type` 0xFE18, no section he
 * The "dump file" prompt and the ".init_proc protected" warning are skipped for these files.
 * `Il2CppTypeDefinitionSizes` living in the read-only code segment no longer make the `MetadataRegistration` search fail.
 * Fake-signed SELF (`4F 15 3D 1D`, output of make_fself) is unwrapped in memory, no unfself step needed.
+* `ps4tools/il2mem.py` pulls `global-metadata.dat` and a loadable image of the module out of a ps4debug memory dump
+  (`ps4dump.py` from ps4-unreal-dumper), so a running game is enough: no prx/metadata files, no decryption.
+  Run the dumper on the two outputs with `NoRedirectedPointer: true` and the printed base as dump address.
 * When LTO folded `Il2CppCodeRegistration` into code (seen in Blasphemous 2), it is reconstructed from the
   code gen module table, the generic method pointer table and the invoker table (`Utils/LtoSearch.cs`).
 
