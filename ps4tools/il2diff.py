@@ -41,21 +41,24 @@ class Diff:
 
     # ---- value scan ---------------------------------------------------------------------------------------------------
     def scan(self, va, vb):
-        byb = {(r["start"], r["end"]): r for r in self.b.regs}
+        """Addresses whose 32-bit int or float is va in dump a and vb in dump b. Regions are matched by address overlap,
+        region boundaries move between dumps when the heap grows."""
         hits = []
         for r in self.a.regs:
-            rb = byb.get((r["start"], r["end"]))
-            if not rb:
-                continue
-            n = (r["end"] - r["start"]) // 4
-            for dtype, fa, fb in ((np.int32, int(va), int(vb)), (np.float32, float(va), float(vb))):
-                if dtype is np.int32 and (fa != va or fb != vb):
+            for rb in self.b.regs:
+                lo, hi = max(r["start"], rb["start"]), min(r["end"], rb["end"])
+                if hi - lo < 4:
                     continue
-                x = np.frombuffer(self.a.m, dtype=dtype, count=n, offset=r["offset"])
-                y = np.frombuffer(self.b.m, dtype=dtype, count=n, offset=rb["offset"])
-                for i in np.nonzero((x == fa) & (y == fb))[0]:
-                    hits.append((r["start"] + int(i) * 4, "int" if dtype is np.int32 else "float"))
-        return hits
+                n = (hi - lo) // 4
+                oa, ob = r["offset"] + lo - r["start"], rb["offset"] + lo - rb["start"]
+                for dtype, fa, fb in ((np.int32, int(va), int(vb)), (np.float32, float(va), float(vb))):
+                    if dtype is np.int32 and (fa != va or fb != vb):
+                        continue
+                    x = np.frombuffer(self.a.m, dtype=dtype, count=n, offset=oa)
+                    y = np.frombuffer(self.b.m, dtype=dtype, count=n, offset=ob)
+                    for i in np.nonzero((x == fa) & (y == fb))[0]:
+                        hits.append((lo + int(i) * 4, "int" if dtype is np.int32 else "float"))
+        return sorted(set(hits))
 
     # ---- object structure ---------------------------------------------------------------------------------------------
     def owner(self, va, maxback=0x100000):
@@ -215,7 +218,8 @@ class Diff:
 async def amain(a):
     diff = Diff(a.dumpdir, a.a, a.b, a.depth, a.parents)
     hits = diff.scan(a.eq[0], a.eq[1])
-    print(f"{len(hits)} locations are {a.eq[0]} in {a.a} and {a.eq[1]} in {a.b}", file=sys.stderr)
+    shared = sum(min(r["end"], rb["end"]) - max(r["start"], rb["start"]) for r in diff.a.regs for rb in diff.b.regs if min(r["end"], rb["end"]) > max(r["start"], rb["start"]))
+    print(f"{len(hits)} locations are {a.eq[0]} in {a.a} and {a.eq[1]} in {a.b} ({shared >> 20} MB compared)", file=sys.stderr)
     for va, kind in hits[:a.hits]:
         paths = await diff.paths_to(va, a.paths)
         if not paths:
