@@ -18,6 +18,13 @@ NOISE_NS = ("System", "UnityEngine", "TMPro", "Unity.", "Cinemachine")
 NOISE_NAMES = ("StatChangedArgs", "Action", "Delegate", "MulticastDelegate", "Func", "EventHandler")
 
 
+def as_int(v):
+    try:
+        return int(str(v), 0)
+    except ValueError:
+        return None
+
+
 class Diff:
     def __init__(self, dumpdir, ja, jb, depth, max_parents):
         self.a, self.b = il2live.Dump(dumpdir, ja), il2live.Dump(dumpdir, jb)
@@ -51,9 +58,9 @@ class Diff:
                     continue
                 n = (hi - lo) // 4
                 oa, ob = r["offset"] + lo - r["start"], rb["offset"] + lo - rb["start"]
-                for dtype, fa, fb in ((np.int32, int(va), int(vb)), (np.float32, float(va), float(vb))):
-                    if dtype is np.int32 and (fa != va or fb != vb):
-                        continue
+                for dtype, fa, fb in ((np.int32, as_int(va), as_int(vb)), (np.float32, float(va), float(vb))):
+                    if fa is None or fb is None:
+                        continue                       # 2.5 is never an int32
                     x = np.frombuffer(self.a.m, dtype=dtype, count=n, offset=oa)
                     y = np.frombuffer(self.b.m, dtype=dtype, count=n, offset=ob)
                     for i in np.nonzero((x == fa) & (y == fb))[0]:
