@@ -167,6 +167,8 @@ class Runtime:
         hdr = [struct.unpack_from("<ii", m, i + 8 + k * 8) for k in range(31)]
         self.str0, self.str1 = self.meta + hdr[2][0], self.meta + hdr[2][0] + hdr[2][1]
         td_off, td_size = hdr[19]
+        self.td_off, self.td_count = td_off, td_size // 0x58
+        self.typedef_names = {t.idx: t.full for t in types.values()}
         self.module = module
         self.base = dump.module_base(module)
         cache = dump.path + ".klasses.json"            # the two numpy passes take ~50 s on a 3 GB dump
@@ -175,6 +177,7 @@ class Runtime:
             assert c["size"] == os.path.getsize(dump.path)
             self.klasses = {int(k): v for k, v in c["klasses"].items()}
             self.table_off = c["table_off"]
+            self.meta_off = c["meta_off"]
         except Exception:
             name_vas = {self.str0 + struct.unpack_from("<i", m, i + td_off + k * 0x58)[0] for k in range(td_size // 0x58)}
             self.klasses = self.find_klasses(np.array(sorted(name_vas), dtype=np.uint64))
@@ -182,11 +185,30 @@ class Runtime:
             for k in self.klasses:
                 self.by_full.setdefault(self.full_name(k), []).append(k)
             self.table_off = self.find_table_off()
-            json.dump({"size": os.path.getsize(dump.path), "klasses": self.klasses, "table_off": self.table_off}, open(cache, "w"))
+            self.meta_off = self.find_pointer_off(self.meta)
+            json.dump({"size": os.path.getsize(dump.path), "klasses": self.klasses, "table_off": self.table_off, "meta_off": self.meta_off}, open(cache, "w"))
         self.klass_arr = np.array(sorted(self.klasses), dtype=np.uint64)
         self.by_full = {}
         for k in self.klasses:
             self.by_full.setdefault(self.full_name(k), []).append(k)
+
+    def find_pointer_off(self, target):
+        """Module offset of a qword holding `target` (e.g. the s_GlobalMetadata global); None if absent."""
+        for r, a in self.d.arrays():
+            if r["name"] == self.module:
+                for j in np.nonzero(a == np.uint64(target))[0]:
+                    return r["start"] + int(j) * 8 - self.base
+        return None
+
+    async def typedef_of_type(self, read, il2cpptype):
+        """dump.cs full name for an Il2CppType* of a class/struct: data points at its Il2CppTypeDefinition inside the
+        metadata (v27+), metadata base read live from the module global."""
+        if self.meta_off is None:
+            return None
+        meta = await read_u64(read, self.base + self.meta_off)
+        data = await read_u64(read, il2cpptype)
+        idx, rest = divmod(data - meta - self.td_off, 0x58)
+        return self.typedef_names.get(idx) if rest == 0 and 0 <= idx < self.td_count else None
 
     def find_table_off(self):
         """Module offset of the il2cpp global that points at the Il2CppClass* table indexed by TypeDefIndex
@@ -301,6 +323,10 @@ class Runtime:
 class Resolver:
     def __init__(self, rt):
         self.rt, self.types = rt, rt.types
+
+    def find_types(self, name):
+        base = split_generic(name)[0]
+        return [t for f, t in self.types.items() if f == name or f == base or f.endswith("." + base) or t.name.split("<")[0] == base]
 
     def find_type(self, name, hint_ns=""):
         if name in self.types:
@@ -442,15 +468,20 @@ async def dict_key_names(res, rt, read, ktype, entry):
     ['_guid=abc', 'name=xyz', ...] from identifier-like string/int fields of the key object (first one is used for output)."""
     if ktype == "string":
         return [await read_string(read, await read_u64(read, entry + 8))]
-    if ktype in PRIM or (res.find_type(ktype) or Type("class", "", "", [], 0)).kind == "enum":
-        fmt = PRIM.get(ktype, ("i", 4))
-        if ktype not in PRIM:
-            fmt = PRIM.get(res.find_type(ktype).enum_base, ("i", 4))
+    kinds = {t.kind for t in res.find_types(ktype)}
+    if ktype in PRIM or kinds == {"enum"}:
+        fmt = PRIM.get(ktype) or PRIM.get(res.find_types(ktype)[0].enum_base, ("i", 4))
         return [str(struct.unpack("<" + fmt[0], await read_(read, entry + 8, fmt[1]))[0])]
     kobj = await read_u64(read, entry + 8)
     if not kobj:
         return []
     kt = await rt.object_type_live(read, kobj) or res.find_type(ktype)
+    if kt and kt.ns == "System" and kt.name in ("Type", "RuntimeType", "MonoType"):   # System.Type key: name of the type it stands for
+        try:
+            name = await rt.typedef_of_type(read, await read_u64(read, kobj + 0x10))
+        except LookupError:
+            name = None
+        return [f"Type={name}", f"Type={name.split('.')[-1]}"] if name else []
     out = []
     c = kt
     while c:
@@ -643,6 +674,7 @@ async def amain(a):
         if not bases:
             sys.exit(f"{a.module} not mapped in pid {pid}; is the game running?")
         base = min(bases)
+        rt.base = base                                   # live module base for the TypeInfo table and metadata globals
         print(f"live: pid {pid}, {a.module} at {base:#x}", file=sys.stderr)
         async def read(va, n):
             return await dbg.read_memory(pid, va, n)
