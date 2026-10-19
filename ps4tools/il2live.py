@@ -6,8 +6,10 @@
     python il2live.py <dumpdir> --find mana                              # paths from all static fields whose field name contains "mana"
     python il2live.py <dumpdir> --find 50.0 --depth 4                    # ... whose value is 50.0
 
-<dumpdir> holds dump.bin + dump.json (ps4dump.py, taken in the running game session) and sdk/dump.cs from Il2CppDumper
-(il2mem.py builds the sdk from the same dump). Without --host every read comes from the dump.
+<dumpdir> holds dump.bin + dump.json (ps4dump.py) and sdk/dump.cs from Il2CppDumper (il2mem.py builds the sdk from the
+same dump). Without --host every read comes from the dump. Live, the dump only provides layouts and the offset of the
+TypeInfo table in the module: static roots and object classes are resolved in the running process, so the dump may come
+from an earlier session of the same game build.
 
 Path syntax (talixme's GUI passes it through unchanged):
     Class::field        static field of Class (root), nested classes as Outer.Inner, namespace optional: Ns.Class::field
@@ -38,8 +40,8 @@ FIELD_RE = re.compile(r"^\t(?P<decl>.+?)(?: = (?P<val>.*?))?; // 0x(?P<off>[0-9A
 
 # ---- dump.cs ---------------------------------------------------------------------------------------------------
 class Type:
-    def __init__(self, kind, name, ns, bases):
-        self.kind, self.name, self.ns, self.bases = kind, name, ns, bases
+    def __init__(self, kind, name, ns, bases, idx):
+        self.kind, self.name, self.ns, self.bases, self.idx = kind, name, ns, bases, idx
         self.fields, self.statics, self.enum_base = {}, {}, "int"      # offset -> (type, name)
 
     @property
@@ -57,7 +59,7 @@ def parse_dump_cs(path):
         m = TYPE_RE.match(line)
         if m:
             bases = [b.strip() for b in m["bases"].split(",")] if m["bases"] else []
-            cur = Type(m["kind"], m["name"], ns, bases); types[cur.full] = cur; continue
+            cur = Type(m["kind"], m["name"], ns, bases, int(m["idx"])); types[cur.full] = cur; continue
         if cur is None:
             continue
         if line == "}" or line.startswith("\t// Methods") or line.startswith("\t// Properties"):
@@ -140,7 +142,7 @@ class Dump:
 
 # ---- Il2Cpp runtime structures in the dump -------------------------------------------------------------------------
 class Runtime:
-    def __init__(self, dump, types):
+    def __init__(self, dump, types, module="Il2CppUserAssemblies.prx"):
         self.d, self.types = dump, types
         m = dump.m
         i = m.find(b"\xaf\x1b\xb1\xfa")
@@ -151,19 +153,44 @@ class Runtime:
         hdr = [struct.unpack_from("<ii", m, i + 8 + k * 8) for k in range(31)]
         self.str0, self.str1 = self.meta + hdr[2][0], self.meta + hdr[2][0] + hdr[2][1]
         td_off, td_size = hdr[19]
+        self.module = module
+        self.base = dump.module_base(module)
         cache = dump.path + ".klasses.json"            # the two numpy passes take ~50 s on a 3 GB dump
         try:
             c = json.load(open(cache))
             assert c["size"] == os.path.getsize(dump.path)
             self.klasses = {int(k): v for k, v in c["klasses"].items()}
+            self.table_off = c["table_off"]
         except Exception:
             name_vas = {self.str0 + struct.unpack_from("<i", m, i + td_off + k * 0x58)[0] for k in range(td_size // 0x58)}
             self.klasses = self.find_klasses(np.array(sorted(name_vas), dtype=np.uint64))
-            json.dump({"size": os.path.getsize(dump.path), "klasses": self.klasses}, open(cache, "w"))
+            self.by_full = {}
+            for k in self.klasses:
+                self.by_full.setdefault(self.full_name(k), []).append(k)
+            self.table_off = self.find_table_off()
+            json.dump({"size": os.path.getsize(dump.path), "klasses": self.klasses, "table_off": self.table_off}, open(cache, "w"))
         self.klass_arr = np.array(sorted(self.klasses), dtype=np.uint64)
         self.by_full = {}
         for k in self.klasses:
             self.by_full.setdefault(self.full_name(k), []).append(k)
+
+    def find_table_off(self):
+        """Module offset of the il2cpp global that points at the Il2CppClass* table indexed by TypeDefIndex
+        (MetadataCache s_TypeInfoDefinitionTable). Session independent, so live roots never depend on dump addresses."""
+        d = self.d
+        probes = [(t.idx, self.by_full[t.full][0]) for t in self.types.values() if t.kind == "class" and t.full in self.by_full and len(self.by_full[t.full]) == 1][:40]
+        if len(probes) < 5:
+            return None
+        i0, k0 = probes[0]
+        for r, a in d.arrays():
+            for idx in np.nonzero(a == np.uint64(k0))[0]:
+                table = r["start"] + int(idx) * 8 - 8 * i0
+                if all(d.u64(table + 8 * i) == k for i, k in probes[1:]):
+                    for r2, a2 in d.arrays():
+                        if r2["name"] == self.module:
+                            for j in np.nonzero(a2 == np.uint64(table))[0]:
+                                return r2["start"] + int(j) * 8 - self.base
+        return None
 
     def find_klasses(self, name_arr):
         """pass 1: name/namespace point into the metadata string table; pass 2: same image pointer as pass 1 classes
@@ -221,6 +248,40 @@ class Runtime:
         k = self.d.u64(obj)
         return self.type_of_klass(k) if k in self.klasses else None
 
+    async def full_name_live(self, read, k, depth=0):
+        """Namespace.Outer.Inner of a runtime class read through `read` (works live, where klass addresses differ from the dump)."""
+        name = await read_cstr(read, await read_u64(read, k + KLASS_NAME))
+        decl = await read_u64(read, k + KLASS_DECLARING)
+        if decl and depth < 8:
+            try:
+                return f"{await self.full_name_live(read, decl, depth + 1)}.{name}"
+            except LookupError:
+                pass
+        ns = await read_cstr(read, await read_u64(read, k + KLASS_NS))
+        return f"{ns}.{name}" if ns else name
+
+    async def object_type_live(self, read, obj):
+        try:
+            k = await read_u64(read, obj)
+            full = await self.full_name_live(read, k)
+        except LookupError:
+            return None
+        if full in self.types:
+            return self.types[full]
+        base, _ = split_generic(full.split(".")[-1])
+        cands = [t for t in self.types.values() if t.name.split("<")[0] == base]
+        return cands[0] if cands else None
+
+    async def statics_live(self, read, base, t):
+        """Static field block of dump.cs type t in the running process: [[base + table_off] + 8 * TypeDefIndex] -> klass -> static_fields."""
+        if self.table_off is None:
+            sys.exit("TypeInfo table not found in the dump, cannot resolve static roots")
+        table = await read_u64(read, base + self.table_off)
+        klass = await read_u64(read, table + 8 * t.idx)
+        if not klass:
+            return None, None
+        return await read_u64(read, klass + KLASS_STATICS), klass
+
 
 # ---- path resolution -------------------------------------------------------------------------------------------------
 class Resolver:
@@ -276,17 +337,17 @@ def elem_size(res, tname):
     return 8
 
 
-async def follow(res, rt, read, path, auto_cast=True, trace=None):
-    """Resolve the path; returns (address of the final field, type string). read(va, n) -> bytes or None."""
+async def follow(res, rt, read, base, path, auto_cast=True, trace=None):
+    """Resolve the path; returns (address of the final field, type string). read(va, n) -> bytes or None,
+    base = module base in the process being read (dump or live)."""
     segs = res.tokens(path)
     kind, cls_name, sname = segs[0]
     t = res.find_type(cls_name)
     if not t:
         sys.exit(f"class {cls_name} not in dump.cs")
-    k = rt.klass_of(t.full)
+    statics, k = await rt.statics_live(read, base, t)
     if not k:
-        sys.exit(f"no runtime class for {t.full} in the dump (not loaded yet?)")
-    statics = rt.d.u64(k + KLASS_STATICS)
+        sys.exit(f"{t.full} is not initialized in the process yet")
     if not statics:
         sys.exit(f"{t.full} has no static field block")
     hit = [(o, ft) for o, (ft, fn) in t.statics.items() if fn == sname]
@@ -294,7 +355,7 @@ async def follow(res, rt, read, path, auto_cast=True, trace=None):
         sys.exit(f"{t.full} has no static field {sname}; statics: {[fn for _, (_, fn) in t.statics.items()]}")
     addr, ftype = statics + hit[0][0], hit[0][1]
     if trace is not None:
-        trace.append(f"{t.full}::{sname} @ {addr:#x} ({ftype})")
+        trace.append(f"{t.full}::{sname} @ {addr:#x} ({ftype}) klass {k:#x}")
     cur_t = None                                     # type of the object we are inside, once dereferenced
     for op, arg in segs[1:]:
         if op == "cast":
@@ -311,7 +372,7 @@ async def follow(res, rt, read, path, auto_cast=True, trace=None):
                 if not obj:
                     return None, f"null at {addr:#x}"
                 if op == "field":
-                    cur_t = (rt.object_type(obj) if auto_cast else None) or res.find_type(ftype, cur_t.ns if cur_t else "")
+                    cur_t = (await rt.object_type_live(read, obj) if auto_cast else None) or res.find_type(ftype, cur_t.ns if cur_t else "")
                     if cur_t is None:
                         sys.exit(f"unknown class for field type {ftype}")
             if op == "field":
@@ -375,6 +436,13 @@ async def read_u64(read, va):
     return struct.unpack("<Q", await read_(read, va, 8))[0]
 
 
+async def read_cstr(read, va, n=96):
+    b = await read(va, n) if va else None
+    if not b:
+        raise LookupError(f"cannot read string at {va:#x}")
+    return b.split(b"\0")[0].decode("latin-1")
+
+
 def value_format(res, ftype):
     if ftype in PRIM:
         return PRIM[ftype][0]
@@ -392,7 +460,7 @@ async def read_value(res, read, addr, ftype):
 
 
 # ---- --find: BFS from every static field ------------------------------------------------------------------------------
-async def find(res, rt, read, word, depth, max_paths=200):
+async def find(res, rt, read, base, word, depth, max_paths=200):
     """Paths from static roots to fields whose name contains `word` or whose value equals it. Prints path<TAB>type<TAB>value."""
     try:
         want_val = float(word)
@@ -401,12 +469,12 @@ async def find(res, rt, read, word, depth, max_paths=200):
     out, seen = [], set()
     roots = []
     for t in res.types.values():
-        if not t.statics or t.kind != "class":
+        if not t.statics or t.kind != "class" or "<" in t.name:
             continue
-        k = rt.klass_of(t.full) if t.full in rt.by_full else None
-        if not k:
+        try:
+            statics, k = await rt.statics_live(read, base, t)
+        except LookupError:
             continue
-        statics = rt.d.u64(k + KLASS_STATICS)
         if statics:
             for off, (ft, fn) in t.statics.items():
                 roots.append((f"{t.full}::{fn}", statics + off, ft, 0))
@@ -484,7 +552,7 @@ async def children(res, rt, read, path, addr, ftype):
         except LookupError:
             pass
         return out
-    t = rt.object_type(obj) or res.find_type(ftype)
+    t = await rt.object_type_live(read, obj) or res.find_type(ftype)
     if not t or t.kind not in ("class", "struct") or t.ns.startswith(("System", "UnityEngine", "TMPro", "Unity.")):
         return []
     c = t
@@ -496,28 +564,53 @@ async def children(res, rt, read, path, addr, ftype):
 
 
 # ---- main ---------------------------------------------------------------------------------------------------------------
+async def game_pid(dbg):
+    """PID of the running game: eboot.bin, else the single process whose title id starts with CUSA/PPSA.
+    (from ps4-unreal-dumper tools/ueobj.py)"""
+    procs = await dbg.get_processes()
+    c = [p.pid for p in procs if p.name.rstrip("\0") == "eboot.bin"]
+    if not c:
+        for p in procs:
+            if p.pid > 100:
+                try:
+                    if (await dbg.get_process_info(p.pid)).title_id.startswith(("CUSA", "PPSA")):
+                        c.append(p.pid)
+                except Exception:
+                    pass
+    if len(c) == 1:
+        return c[0]
+    sys.exit(f"expected one game process, found {len(c)}: {[(p.pid, p.name.rstrip(chr(0))) for p in procs if p.pid > 100]}")
+
+
 async def amain(a):
     dump = Dump(a.dumpdir, a.json)
     types = parse_dump_cs(os.path.join(a.dumpdir, "sdk", "dump.cs"))
-    rt = Runtime(dump, types)
+    rt = Runtime(dump, types, a.module)
     res = Resolver(rt)
-    print(f"{len(types)} types, {len(rt.klasses)} runtime classes, metadata {rt.meta:#x}", file=sys.stderr)
+    print(f"{len(types)} types, {len(rt.klasses)} runtime classes, metadata {rt.meta:#x}, TypeInfo table at {a.module}+{rt.table_off:#x}", file=sys.stderr)
 
     if a.host:
         import ps4debug
         dbg = ps4debug.PS4Debug(a.host)
-        pid = dump.pid
+        pid = await game_pid(dbg)
+        maps = await dbg.get_process_maps(pid)
+        bases = [e.start for e in maps.entries if e.name == a.module]
+        if not bases:
+            sys.exit(f"{a.module} not mapped in pid {pid}; is the game running?")
+        base = min(bases)
+        print(f"live: pid {pid}, {a.module} at {base:#x}", file=sys.stderr)
         async def read(va, n):
             return await dbg.read_memory(pid, va, n)
     else:
+        base = rt.base
         async def read(va, n):
             return dump.read(va, n)
 
     if a.find:
-        await find(res, rt, read, a.find, a.depth)
+        await find(res, rt, read, base, a.find, a.depth)
         return
     trace = []
-    addr, ftype = await follow(res, rt, read, a.path, trace=trace)
+    addr, ftype = await follow(res, rt, read, base, a.path, trace=trace)
     for line in trace:
         print("  " + line, file=sys.stderr)
     if addr is None:
@@ -540,6 +633,7 @@ if __name__ == "__main__":
     ap.add_argument("path", nargs="?")
     ap.add_argument("--json", default="dump.json", help="dump json name inside dumpdir (default dump.json)")
     ap.add_argument("--host", help="PS4/PS5 IP for live access via ps4debug (default: read from the dump)")
+    ap.add_argument("--module", default="Il2CppUserAssemblies.prx", help="il2cpp module name (default Il2CppUserAssemblies.prx)")
     ap.add_argument("--set", help="value to write (live only)")
     ap.add_argument("--find", help="field name substring or numeric value to search from all static fields")
     ap.add_argument("--depth", type=int, default=3, help="pointer hops for --find (default 3)")
